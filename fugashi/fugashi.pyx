@@ -4,8 +4,6 @@ from fugashi.mecab cimport (mecab_new, mecab_sparse_tostr2, mecab_t, mecab_node_
         mecab_dictionary_info_t, mecab_dictionary_info,
         mecab_model_new, mecab_strerror, mecab_dict_index,
         
-        mecab_nbest_init, mecab_nbest_next_tonode,
-        
         mecab_lattice_t,
         mecab_lattice_new, mecab_lattice_set_request_type, mecab_lattice_set_sentence,
         mecab_parse_lattice, mecab_lattice_get_bos_node, mecab_lattice_next
@@ -356,7 +354,7 @@ cdef class Tagger(GenericTagger):
     Unidic 2.1.2 (17 field) and 2.2, 2.3 format (29 field) are supported.
     """
 
-    def __init__(self, num_paths=1, args=''):
+    def __init__(self, args='', num_paths=1):
         # Use pip installed unidic if available
         unidicdir = try_import_unidic()
         if unidicdir:
