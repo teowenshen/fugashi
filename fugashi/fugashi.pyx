@@ -2,7 +2,14 @@
 from fugashi.mecab cimport (mecab_new, mecab_sparse_tostr2, mecab_t, mecab_node_t,
         mecab_sparse_tonode, mecab_nbest_sparse_tostr, 
         mecab_dictionary_info_t, mecab_dictionary_info,
-        mecab_model_new, mecab_strerror, mecab_dict_index)
+        mecab_model_new, mecab_strerror, mecab_dict_index,
+        
+        mecab_nbest_init, mecab_nbest_next_tonode,
+        
+        mecab_lattice_t,
+        mecab_lattice_new, mecab_lattice_set_request_type, mecab_lattice_set_sentence,
+        mecab_parse_lattice, mecab_lattice_get_bos_node, mecab_lattice_next
+        )
 from collections import namedtuple
 import os
 import csv
@@ -209,11 +216,14 @@ cdef class GenericTagger:
     cdef mecab_t* c_tagger
     cdef object wrapper
     cdef dict _cache
+    cdef mecab_lattice_t* lattice
+    cdef int num_paths 
 
-    def __init__(self, args='', wrapper=make_tuple, quiet=False):
+    def __init__(self, args='', num_paths=1, wrapper=make_tuple, quiet=False):
         # The first argument is ignored because in the MeCab binary the argc
         # and argv for the process are used here.
         args = [b'fugashi', b'-C'] + [bytes(arg, 'utf-8') for arg in shlex.split(args)]
+        
         cdef int argc = len(args)
         cdef char** argv = <char**>malloc(argc * sizeof(char*))
         for ii, arg in enumerate(args):
@@ -232,10 +242,19 @@ cdef class GenericTagger:
         free(argv)
         self.wrapper = wrapper
         self._cache = {}
+        
+        self.num_paths = num_paths
+        self.lattice = mecab_lattice_new()
+        if num_paths > 1:
+            # MECAB_NBEST == 2
+            mecab_lattice_set_request_type(self.lattice, 2)
+        else:
+            # MECAB_ONE_BEST == 1
+            mecab_lattice_set_request_type(self.lattice, 1)
 
-    def __call__(self, text):
+    def __call__(self, text, num_paths=None):
         """Wrapper for parseToNodeList."""
-        return self.parseToNodeList(text)
+        return self.parseToNodeList(text, num_paths)
 
     def parse(self, str text):
         btext = bytes(text, 'utf-8')
@@ -249,42 +268,44 @@ cdef class GenericTagger:
         # This function just exists so subclasses can override the node type.
         return Node.wrap(node, self.wrapper)
 
-    def parseToNodeList(self, text):
-        # cstr = bytes(text, 'utf-8')
-        bstr = bytes(text, 'utf-8')
-        cdef const mecab_node_t* node = mecab_sparse_tonode(self.c_tagger, bstr)
+    def parseToNodeList(self, text, num_paths):
+        if not num_paths:
+            num_paths = self.num_paths
+        cstr = bytes(text, 'utf-8')
+        mecab_lattice_set_sentence(self.lattice, cstr)
+        assert mecab_parse_lattice(self.c_tagger, self.lattice), (
+            "mecab_parse_lattice: Something wrong happened when attempting to parse the lattice."
+        )
+        ret = []
+        
+        for i in range(num_paths):
+            node = mecab_lattice_get_bos_node(self.lattice)
 
-        # A nodelist always contains one each of BOS and EOS (beginning/end of
-        # sentence) nodes. Since they have no information on them and MeCab
-        # doesn't do any kind of sentence tokenization they're not useful in
-        # the output and will be removed here.
+            out = []
+            while node.next:
+                node = node.next
+                nn = self.wrap(node)
 
-        # Node that on the command line this behavior is different, and each
-        # line is treated as a sentence.
+                if node.stat == 3:
+                    break
 
-        out = []
-        while node.next:
-            node = node.next
-            if node.stat == 3: # eos node
-                return out
-            nn = self.wrap(node)
+                surf = node.surface[:node.length]
+                shash = hash(surf)
+                if shash not in self._cache:
+                    self._cache[shash] = sys.intern(surf.decode("utf-8"))
+                nn.surface = self._cache[shash]
 
-            # TODO maybe add an option to this function that doesn't cache the
-            # surface. Not caching here is faster but means node surfaces are 
-            # invalidated on the next call of this function.
+                out.append(nn)
+            
+            ret.append(out)
 
-            # In theory the input string should be re-usable, but it's hard to
-            # track ownership of it in Python properly.
+            if not mecab_lattice_next(self.lattice):
+                break
 
-            # avoid new string allocations
-            # TODO try lru cache instead of intern (reason: good to age stuff out)
-            surf = node.surface[:node.length]
-            shash = hash(surf)
-            if shash not in self._cache:
-                self._cache[shash] = sys.intern(surf.decode("utf-8"))
-            nn.surface = self._cache[shash]
-
-            out.append(nn)
+        if num_paths == 1:
+            return ret[0]
+        else:
+            return ret
 
 
     def nbest(self, text, num=10):
@@ -335,16 +356,15 @@ cdef class Tagger(GenericTagger):
     Unidic 2.1.2 (17 field) and 2.2, 2.3 format (29 field) are supported.
     """
 
-    def __init__(self, arg=''):
+    def __init__(self, num_paths=1, args=''):
         # Use pip installed unidic if available
         unidicdir = try_import_unidic()
         if unidicdir:
             mecabrc = os.path.join(unidicdir, 'mecabrc')
-            arg = '-r "{}" -d "{}" '.format(mecabrc, unidicdir) + arg
+            args = '-r "{}" -d "{}" '.format(mecabrc, unidicdir) + args
 
-        super().__init__(arg)
-
-        fields = self.parseToNodeList("日本")[0].feature_raw.split(',')
+        super().__init__(num_paths=num_paths, args=args)
+        fields = self.parseToNodeList("日本", num_paths=1)[0].feature_raw.split(',')
 
         if len(fields) == 17:
             self.wrapper = UnidicFeatures17
